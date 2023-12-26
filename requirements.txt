@@ -1,0 +1,8 @@
+# control keyboard
+keyboard
+
+# read & write clipboard
+winclip32
+
+# read state of Numlock
+pywin32
