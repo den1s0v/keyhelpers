@@ -30,6 +30,7 @@
 
 
 from contextlib import contextmanager
+from math import copysign
 import re
 import os
 from time import sleep
@@ -55,8 +56,16 @@ TRIGGER_KEYS.SHRINK_MULTIPLE_SPACES = ['left shift', 'windows', 'right shift']
 # TRIGGER_KEYS.SHRINK_MULTIPLE_SPACES = ['alt', 'c']
 TRIGGER_KEYS.SELECTED_TO_LOWER = ['shift', 'windows', 'left']
 
+TRIGGER_KEYS.CUSTOM_TRANSFORM = ['shift', 'windows', 'alt']
+
+
 REASSIGN_INTERVAL = 180  # seconds
 
+POS_CORRECTION = True  # alg will try to sync tracking position with actual position where possible
+MAX_CORRECTED_DISTANCE = 10  # how far actual position can be (in chars)
+
+
+TM = None # TextManipulator
 
 def print_commands_help():
     for name, comb in TRIGGER_KEYS.items():
@@ -69,7 +78,10 @@ import winclip32
 def get_clipboard_text():
     try:
         if winclip32.is_clipboard_format_available("unicode_std_text"):
-            return winclip32.get_clipboard_data("unicode_std_text")
+            content = winclip32.get_clipboard_data("unicode_std_text")
+            return fix_line_endings(content)
+            # return content
+
     except winclip32.errors.clipboard_format_is_not_available:
         pass
     return ''
@@ -110,21 +122,22 @@ def no_numlock(verbose=False):
         # temporarily turn numlock OFF
         keyboard.send('num lock')
 
-    yield
-
-    if numlock_on:
-        # restore numlock state
-        keyboard.send('num lock')
+    try: yield
+    except: raise
+    finally:
+        if numlock_on:
+            # restore numlock state
+            keyboard.send('num lock')
 
 def fix_line_endings(text: str):
     return text.replace('\r\n', '\n')
 
 def copy_selected() -> str:
-    # Вставить текст в буфер
+    # Взять текст в буфер
     with no_numlock():
         keyboard.send('ctrl + insert')
     sleep(0.02)
-    return fix_line_endings(get_clipboard_text())
+    return get_clipboard_text()
 
 
 def paste_text(text):
@@ -143,6 +156,382 @@ def send_text_to_editor(text, len_treshold=100):
     else:
         # Вставит текст через буфер, заменяя старый (быстрее, если текст длинный)
         paste_text(text)
+
+
+class MutableString(object):
+    def __init__(self, data):
+        self.data = list(data)
+    def __repr__(self):
+        return "".join(self.data)
+    __str__ = __repr__
+    def __setitem__(self, index, value):
+        if type(index) == slice:
+            self.data[index] = list(value)
+        else:
+            self.data[index] = value
+    def __getitem__(self, index):
+        if type(index) == slice:
+            return "".join(self.data[index])
+        return self.data[index]
+    def __delitem__(self, index):
+        del self.data[index]
+    def __add__(self, other):
+        self.data.extend(list(other))
+    def __len__(self):
+        return len(self.data)
+
+def findall(sub, string):
+    """
+    @see: https://stackoverflow.com/a/3874760/12824563
+    >>> text = "Allowed Hello Hollow"
+    >>> tuple(findall('ll', text))
+    (1, 10, 16)
+    """
+    index = -len(sub)
+    try:
+        while True:
+            index = string.index(sub, index + len(sub))
+            yield index
+    except ValueError:
+        pass
+
+
+class TextManipulator:
+    def __init__(self):
+        self.pos = 0
+        self.sel = [0, 0]  # left pos, right pos of selection
+        self.sel_edge = 0  # 0 or 1 - which side of selection the cursor is at
+        self.mirror = ""
+        self._pos_shift = 0
+        self._validation_tries = 0  # limit: say, 10 or 100
+    clear = __init__
+
+    def set_string(self, string, selected_in_editor=False, relative_pos=None):
+        self.mirror = MutableString(string)
+        if selected_in_editor:
+            self.sel = [0, len(string)]
+        if relative_pos is not None:
+            self.pos = relative_pos
+
+    def get_string(self):
+        return str(self.mirror)
+
+    def sel_len(self):
+        return self.sel[1] - self.sel[0]
+
+    def move_to(self, pos, shift=False):
+        # when not selecting, no prior selection is allowed (limitation of current implementation: extra checks needed).
+        self.move_by(pos - self.pos, shift=shift)
+
+    def move_by(self, steps, shift=False):
+        """Move cursor left (negative) or right (positive) optionally holding Shift."""
+        if steps == 0: return
+        n_steps = int(abs(steps))
+        steps = int(steps)
+        is_right = steps > 0
+
+        keys = 'right' if is_right else 'left'  # arrow
+        if shift: keys = 'shift + ' + keys
+
+        for _ in range(n_steps):
+            ###
+            # print('   move_by ::', keys)
+            # sleep(.25)
+            ###
+            keyboard.send(keys)
+
+        if shift:
+            self.pos += steps
+            if self.sel_len() <= n_steps:
+                # flip selection
+                self.sel[:] = self.sel[::-1]
+                self.sel_edge = is_right
+            self.sel[self.sel_edge] = self.pos
+        else:
+            if self.sel_len() > 0:
+                # no more selection (we've moved to the edge first)
+                self.pos = self.sel[is_right] + int(copysign(n_steps - 1, steps))
+            else:
+                self.pos += steps
+            self.sel = [self.pos, self.pos]
+
+    def select_range(self, start, stop):
+        from_left  = abs(self.pos - start)
+        from_right = abs(stop - self.pos)
+        if from_right < from_left:
+            # select from right
+            self.move_to(stop)
+            self.move_to(start, shift=True)
+        else:
+            # select from left
+            self.move_to(start)
+            self.move_to(stop, shift=True)
+
+    def delete_selected_text(self):
+        '& update self.sel'
+        keyboard.send('delete')
+        # track changes internally
+        self.mirror[self.sel[0] : self.sel[1]] = ''
+        # update sel positions
+        self.sel[1] = self.sel[0]
+        # update pos
+        self.pos = self.sel[0]
+
+    def write_text(self, text):
+        if not text:
+            return
+        send_text_to_editor(text)
+        self.mirror[self.pos : self.pos] = text  # track changes
+        self.pos += len(text)
+
+    def validate_position(self):
+        """ Using and extending selection if required, verify current position (self.pos) and amend it if needed and possible."""
+
+        selected_extra = 0
+        sel_direction = +1  # -1 (left) or +1 (right)
+
+        def finalize():
+            # undo selection changes
+            self.move_by(-sel_direction * selected_extra, shift=True)
+
+        def apply_correction(correction: int):
+            self.pos += correction
+            self.sel[0] += correction
+            self.sel[1] += correction
+            print('Appiled correction to pos: %+d' % correction)
+
+
+        # if self.sel_len() > 0:
+        #     self.move_by(-1)  # reset sel to left
+
+        if self.sel_len() <= 0:
+            # make selection
+            if self.pos + (MAX_CORRECTED_DISTANCE // 2) > len(self.mirror):
+                sel_direction = -1  # grow to left
+            self.move_by(sel_direction, shift=True)
+            selected_extra += 1
+            ###
+            print(f'### validate_position: selected 1 char to {sel_direction}')
+
+
+        # copy selection to check where we are
+        selected = copy_selected()
+        tracked_sel = self.mirror[slice(*self.sel)]
+        if len(selected) != self.sel_len():
+            # stop working on serious error, ex. if user has clicked on different place in editor or switched an application
+            raise RuntimeError(f'Cannot validate position via selection! (selected `{selected}`, expected: `{tracked_sel}`).')
+
+        if selected == tracked_sel:
+            ###
+            print(f'### validate_position: OK!')
+
+            # OK!
+            finalize()
+            return True
+
+        # try to correct self.pos...
+
+        mirror_str = str(self.mirror)
+        if selected not in mirror_str:
+            # The issue may be also due moving out of the edge of processed piece of text (reflected by self.mirror).
+            # stop working on serious error, ex. if user has clicked on different place in editor or switched an application
+            raise RuntimeError(f'Cannot validate position via selection! (cannot find selected `{selected}`; expected: `{tracked_sel}`).')
+
+        ### print(f'### validate_position: mirror_str: `{mirror_str}`\n')
+
+        # find all occurences
+        occurences = list(findall(selected, mirror_str))
+
+        ###
+        print(f'### validate_position: occurences: {occurences}')
+
+        # find closest occurence
+        pos_of_sel = self.sel[0]
+
+        if len(occurences) == 1:  # and abs(occurences[0] - pos_of_sel) <= MAX_CORRECTED_DISTANCE:
+            # this is probably the only candidate to move to
+            # do the correction
+            correction = int(occurences[0] - pos_of_sel)
+            apply_correction(correction)
+
+            finalize()
+            # we have corrected it now, but still need to double-check it
+            return False
+
+        # find nearest occurence
+        dst_to_occurences = sorted([
+                    (abs(p - pos_of_sel), p)
+                    for p in occurences
+                    if abs(p - pos_of_sel) <= MAX_CORRECTED_DISTANCE
+                ])
+
+
+        ###
+        print(f'### validate_position: dst_to_occurences: {dst_to_occurences}')
+
+
+        if len(dst_to_occurences) == 1:
+            # this is probably the only candidate to move to
+            # do the correction
+            correction = int(dst_to_occurences[0][1] - pos_of_sel)
+            apply_correction(correction)
+
+            finalize()
+            # we have corrected it now, but still need to double-check it
+            return False
+
+        else:
+        # elif 0:
+            # there's need to clarify which one we should stick to.
+            # grow selection until we have only one candidate.
+            ...
+            grow_times = min(
+                    MAX_CORRECTED_DISTANCE - self.sel_len(), # max selection size is MAX_CORRECTED_DISTANCE
+                    len(self.mirror) - self.pos  # the rest of mirror
+            )
+            ###
+            print(f'### validate_position: grow_times: {grow_times}')
+
+            for _i in range(grow_times):
+
+                print('trying to recover position, take', _i + 1)
+
+                # grow selection
+                self.move_by(sel_direction)
+                selected_extra += 1
+
+                # (repeat some things from above ...)
+                selected = copy_selected()
+                occurences = list(findall(selected, mirror_str))
+                if not occurences:
+                    break
+                dst_to_occurences = sorted([
+                            (abs(p - pos_of_sel), p)
+                            for p in occurences
+                            if abs(p - pos_of_sel) <= MAX_CORRECTED_DISTANCE
+                        ])
+                if not dst_to_occurences:
+                    break
+
+                if len(dst_to_occurences) == 1:
+                    # we've found the most probable candidate.
+                    # do the correction
+                    correction = int(dst_to_occurences[0][1] - pos_of_sel)
+                    apply_correction(correction)
+
+                    finalize()
+                    # we have corrected it now, but still need to double-check it
+                    return False
+
+        finalize()
+        raise RuntimeError(f'Cannot recover from unexpected position change, stopping. Selected: `{selected}`, occurences: {occurences}')
+
+
+
+    def apply_transformation(self, t):
+        ### print('self._pos_shift:', self._pos_shift)
+        start, stop = t.position.start + self._pos_shift, t.position.stop + self._pos_shift
+
+        if start == stop:
+            # insert text
+            if not t.replacement: return
+
+            self.move_to(start)
+            # send_text_to_editor(t.replacement)
+            # self.mirror[start:stop] = t.replacement
+            # self._pos_shift += len(t.replacement)
+
+        else:
+            # select target area
+            self.select_range(start, stop)
+
+            if POS_CORRECTION:
+                # TODO: verify that target area is selected correctly (avoiding unexpected shifts)
+                for _ in range(10):
+                    # try several times in case that user keeps changing position manually
+                    if self.validate_position():
+                        break
+                    ###
+                    print('### correction loop: try again...')
+                else:
+                    raise RuntimeError('Cannot recover invalid position after several tries, stopping.')
+                # ...
+                # self.select_range(start, stop)
+
+            self.delete_selected_text()
+
+        self.write_text(t.replacement)  # + track changes internally
+        self._pos_shift += len(t.replacement) - (stop - start)
+
+
+    def apply_transformations(self, transformations):
+        """
+            transformations: iterable of adicts:
+            [
+                {position: slice(3,6), replacement: "abc"},  # replace
+                {position: slice(6,7), replacement: ""},     # remove
+                {position: slice(7,7), replacement: "new"},  # insert
+            ]
+
+            The order must be ascending of position; no overlaps.
+        """
+        if transformations:  # anything to process
+
+            # go to leftmost replacement pos ...
+            leftmost_pos = transformations[0].position
+
+            if (sl := self.sel_len()) > 0:
+                # decide which direction to go (we can go both sides at first step)
+                from_left  = abs(self.sel[0] - leftmost_pos.start)
+                from_right = abs(leftmost_pos.stop - self.sel[1])
+                if from_right < from_left:
+                    # move to right side of leftmost replacement
+                    self.move_by(+1)
+                    # self.move_by(-from_right)
+                    ### print('remove selection to its right side')
+                else:
+                    # move to left side of leftmost replacement
+                    self.move_by(-1)
+                    # self.move_by(+from_left)
+                    ### print('remove selection to its left side')
+
+            self._pos_shift = 0
+            for t in transformations:
+                ###
+                print(t, '...')
+                # sleep(.1)
+                ###
+                self.apply_transformation(t)
+
+
+        if self.pos < len(self.mirror):
+            # skip the rest of string
+            self.move_to(len(self.mirror))
+
+
+def get_transformations_for_coherent_strings(a, b):
+    if len(a) != len(b):
+        raise ValueError('strings must be of equal lengths!')
+
+    transformations = []
+    extending_last = False
+
+    for i, (x, y) in enumerate(zip(a, b)):
+        if x == y:
+            extending_last = False
+            continue
+
+        if not extending_last:
+            last = adict(position = slice(i, i + 1), replacement = y)
+            transformations.append(last)
+            extending_last = True
+        else:
+            last = transformations[-1]
+            # extend range and replacement
+            last.position = slice(last.position.start, i + 1)
+            last.replacement += y
+
+    return transformations
 
 
 ####### ---------------------------------------------------- ########
@@ -216,6 +605,9 @@ def toggle_word_title(*args, **kw):
                     print('Put: `%s`' % changed)
                     send_text_to_editor(changed)
 
+                    ###
+                    print(get_transformations_for_coherent_strings(selected, changed))
+
                     # paste back
                     # set_clipboard_text(changed)
                     # keyboard.send('ctrl + v')
@@ -248,7 +640,7 @@ def select_word(*args, **kw):
 
         selected_before = get_clipboard_text()
 
-        # Снять выделение, если оно было и прыгнуть в начало слова
+        # Снять выделение, если оно было, и прыгнуть в начало слова
         keyboard.send('right, ctrl + left')
 
         # select a word to its beginning
@@ -267,10 +659,10 @@ def select_word(*args, **kw):
     keyboard.call_later(go, delay=0.0)
 
 
-    # spaces 32 & 160:     
+    # spaces 32 & 160:  '    '
 
 MULTI_SPACES__RE = re.compile(r'[  ]{2,}')
-SPACED_PUNCT__RE = re.compile(r'\b[  ]+(?=[.,])')
+SPACED_PUNCT__RE = re.compile(r'\b[  ]+(?=[.,)])|(?<=\()[  ]+(?=\w)')
 
 
 def shrink_multiple_spaces(*args, **kw):
@@ -483,6 +875,7 @@ def selected_to_lower(*args, **kw):
 
             sleep(0.1)
             selected = get_clipboard_text()
+            # selected = copy_selected()
 
             if not selected:
                 print('-- (nothing copied.)')
@@ -501,13 +894,81 @@ def selected_to_lower(*args, **kw):
                 if changed != selected:
                     print('Put: `%s`' % changed)
                     # paste_text(changed)
-                    send_text_to_editor(changed)
+
+                    ###
+                    TM.set_string(selected, selected_in_editor=True)
+                    with no_numlock():
+                        TM.apply_transformations(get_transformations_for_coherent_strings(selected, changed))
+
+                    # send_text_to_editor(changed)
 
         print(' ...')
         _ = keyboard.stash_state()  # release all keys
 
     # Wait until all keys of trigger combination are released.
     wait_comb_released(TRIGGER_KEYS.SELECTED_TO_LOWER)
+    keyboard.call_later(go, delay=0.0)
+
+
+def custom_transform(*args, **kw):
+    """ Do some custom transformation in selected text.
+    """
+
+    print('custom hotkey is triggered.')
+
+    def go(*_):
+        print(' - Go !  --  Custom transform.')
+
+        # if True:
+        with backup_of_clipboard():
+
+            # copy
+            # keyboard.send('ctrl + c')
+            keyboard.send('ctrl + insert')
+
+            sleep(0.1)
+            selected = get_clipboard_text()
+            # selected = copy_selected()
+
+            if not selected:
+                print('-- (nothing copied.)')
+            else:
+                print('Got: `%s`' % selected)
+                # ==============================
+                ## sequence.action_kind = 'sequence'
+                ## >>>
+                ## set_enum_value(sequence, action_kind, 'sequence')
+                # changed = re.sub(
+                #     r'(\w+)\.(\w+) = (["\']\w+["\']|\w+);?',
+                #     r'set_enum_value(\1, \2, \3)',
+                #     selected
+                # )
+
+                # transform HTML: remove style attribute, replace nbsp.
+                changed = selected.replace("&nbsp;", " ")
+                changed = changed.replace(' style="border-color: var(--border-color);"', '')
+                # ==============================
+
+                if changed == selected:
+                    print('Everything is already updated.')
+
+                if changed != selected:
+                    print('Put: `%s`' % changed)
+                    # paste_text(changed)
+                    keyboard.send('delete')
+                    keyboard.write(changed)
+
+                    # ###
+                    # TM.set_string(selected, selected_in_editor=True)
+                    # with no_numlock():
+                    #     TM.apply_transformations(get_transformations_for_coherent_strings(selected, changed))
+
+
+        print(' ...')
+        _ = keyboard.stash_state()  # release all keys
+
+    # Wait until all keys of trigger combination are released.
+    wait_comb_released(TRIGGER_KEYS.CUSTOM_TRANSFORM)
     keyboard.call_later(go, delay=0.0)
 
 
@@ -540,6 +1001,13 @@ def main():
         keyboard.add_hotkey(
             ' + '.join(TRIGGER_KEYS.SELECTED_TO_LOWER),
             selected_to_lower,
+            suppress=False,
+            trigger_on_release=False,
+            timeout=1,
+        )
+        keyboard.add_hotkey(
+            ' + '.join(TRIGGER_KEYS.CUSTOM_TRANSFORM),
+            custom_transform,
             suppress=False,
             trigger_on_release=False,
             timeout=1,
@@ -578,4 +1046,6 @@ def main():
 
 
 if __name__ == '__main__':
+
+    TM = TextManipulator()
     main()
