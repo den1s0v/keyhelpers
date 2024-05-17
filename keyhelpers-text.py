@@ -603,16 +603,14 @@ def toggle_word_title(*args, **kw):
 
                 if changed != selected:
                     print('Put: `%s`' % changed)
-                    send_text_to_editor(changed)
+                    # send_text_to_editor(changed)
 
                     ###
-                    print(get_transformations_for_coherent_strings(selected, changed))
+                    # print(get_transformations_for_coherent_strings(selected, changed))
 
-                    # paste back
-                    # set_clipboard_text(changed)
-                    # keyboard.send('ctrl + v')
-
-                    # keyboard.write(changed)
+                    TM.set_string(selected, selected_in_editor=True)
+                    with no_numlock():
+                        TM.apply_transformations(get_transformations_for_coherent_strings(selected, changed))
 
         print(' ...')
         _ = keyboard.stash_state()  # release all keys
