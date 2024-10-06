@@ -135,6 +135,7 @@ def fix_line_endings(text: str):
 def copy_selected() -> str:
     # Взять текст в буфер
     with no_numlock():
+        sleep(0.02)
         keyboard.send('ctrl + insert')
     sleep(0.02)
     return get_clipboard_text()
@@ -563,10 +564,6 @@ def toggle_word_title(*args, **kw):
         # select a word to its beginning
         keyboard.send('shift + ctrl + left')
 
-        if numlock_on:
-            # restore numlock state
-            keyboard.send('num lock')
-
         # if True:
         with backup_of_clipboard():
 
@@ -613,6 +610,10 @@ def toggle_word_title(*args, **kw):
                         TM.apply_transformations(get_transformations_for_coherent_strings(selected, changed))
 
         print(' ...')
+        if numlock_on:
+            # restore numlock state
+            keyboard.send('num lock')
+
         _ = keyboard.stash_state()  # release all keys
 
     # Wait until all keys of trigger combination are released.
