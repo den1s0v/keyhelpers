@@ -316,11 +316,17 @@ class TextManipulator:
 
 
         # copy selection to check where we are
-        selected = copy_selected()
         tracked_sel = self.mirror[slice(*self.sel)]
-        if len(selected) != self.sel_len():
-            # stop working on serious error, ex. if user has clicked on different place in editor or switched an application
-            raise RuntimeError(f'Cannot validate position via selection! (selected `{selected}`, expected: `{tracked_sel}`).')
+
+        for trial in range(3):
+            selected = copy_selected()
+            if len(selected) != self.sel_len():
+                if trial < 2:
+                    print(' ' * 7, 'copy again after delay ...')
+                    sleep(0.05)  # let editor handle changes in selection.
+                    continue
+                # stop working on serious error, ex. if user has clicked on different place in editor or switched an application
+                raise RuntimeError(f'Cannot validate position via selection! (selected `{selected}`, expected: `{tracked_sel}`).')
 
         if selected == tracked_sel:
             ###
